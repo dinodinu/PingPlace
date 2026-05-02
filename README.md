@@ -2,7 +2,7 @@
 
 Control notification position on macOS.
 
-![image](https://github.com/user-attachments/assets/469b318f-eba5-464f-87be-74d3decaa8a2)
+<img width="512" height="170" src="https://github.com/user-attachments/assets/267f33d0-506f-4251-8a25-34d7014146cf" />
 
 As seen in [Lifehacker](https://lifehacker.com/tech/change-where-macos-notifications-show-up)
 
