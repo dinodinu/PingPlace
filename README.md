@@ -2,8 +2,6 @@
 
 Control notification position on macOS.
 
-**Note: macOS 26 users can use [@sk0gen](https://github.com/sk0gen)'s build for the time being, [download here](https://github.com/sk0gen/PingPlace/releases/download/v1.3.2/PingPlace.app.tar.gz)!**
-
 ![image](https://github.com/user-attachments/assets/469b318f-eba5-464f-87be-74d3decaa8a2)
 
 As seen in [Lifehacker](https://lifehacker.com/tech/change-where-macos-notifications-show-up)
@@ -17,20 +15,11 @@ brew install pingplace --no-quarantine
 
 ## Usage
 
-The app needs accessibility permissions to work. It lives in the top bar. You can set notifications to appear in eight positions:
-
-- Top Left
-- Top Middle (default)
-- Top Right (macOS default)
-- Middle Left
-- Middle Right
-- Bottom Left
-- Bottom Middle
-- Bottom Right
+The app needs accessibility permissions to work. It lives in the menu bar. You can set notifications to appear in 8 positions, Top Middle being the default.
 
 ## Requirements
 
-- macOS 14 or later
+- macOS 26.4.1 or later
 - Accessibility permissions
 
 ## Support
@@ -42,4 +31,4 @@ Follow [@WadeGrimridge](https://x.com/WadeGrimridge) on X
 
 ## License
 
-© 2025 All rights reserved.
+© 2026 All rights reserved.

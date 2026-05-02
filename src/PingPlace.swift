@@ -1,563 +1,702 @@
 import ApplicationServices
 import Cocoa
-import os.log
+import OSLog
+import ServiceManagement
 
 enum NotificationPosition: String, CaseIterable {
-    case topLeft, topMiddle, topRight
-    case middleLeft, deadCenter, middleRight
-    case bottomLeft, bottomMiddle, bottomRight
+  case topLeft, topMiddle, topRight
+  case middleLeft, deadCenter, middleRight
+  case bottomLeft, bottomMiddle, bottomRight
 
-    var displayName: String {
-        switch self {
-        case .topLeft: return "Top Left"
-        case .topMiddle: return "Top Middle"
-        case .topRight: return "Top Right"
-        case .middleLeft: return "Middle Left"
-        case .deadCenter: return "Middle"
-        case .middleRight: return "Middle Right"
-        case .bottomLeft: return "Bottom Left"
-        case .bottomMiddle: return "Bottom Middle"
-        case .bottomRight: return "Bottom Right"
-        }
+  var displayName: String {
+    switch self {
+    case .topLeft: "Top Left"
+    case .topMiddle: "Top Middle"
+    case .topRight: "Top Right"
+    case .middleLeft: "Middle Left"
+    case .deadCenter: "Middle"
+    case .middleRight: "Middle Right"
+    case .bottomLeft: "Bottom Left"
+    case .bottomMiddle: "Bottom Middle"
+    case .bottomRight: "Bottom Right"
     }
+  }
 }
 
-class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private let notificationCenterBundleID: String = "com.apple.notificationcenterui"
-    private let paddingAboveDock: CGFloat = 30
-    private var axObserver: AXObserver?
-    private var statusItem: NSStatusItem?
-    private var isMenuBarIconHidden: Bool = UserDefaults.standard.bool(forKey: "isMenuBarIconHidden")
-    private let logger: Logger = .init(subsystem: "com.grimridge.PingPlace", category: "NotificationMover")
-    private let debugMode: Bool = UserDefaults.standard.bool(forKey: "debugMode")
-    private let launchAgentPlistPath: String = NSHomeDirectory() + "/Library/LaunchAgents/com.grimridge.PingPlace.plist"
+private enum AppConstants {
+  static let notificationCenterBundleID = "com.apple.notificationcenterui"
+  static let childrenChangedNotification = "AXChildrenChanged"
+  static let orderedChildrenAttribute = "AXOrderedChildren"
+  static let widgetEditorButtonIdentifier = "widget-editor-button"
+  static let dockPadding: CGFloat = 30
+  static let bannerRightPadding: CGFloat = 16
+  static let bannerSubroles: Set<String> = [
+    "AXNotificationCenterBanner", "AXNotificationCenterAlert",
+    "AXNotificationCenterNotification", "AXNotificationCenterBannerWindow",
+  ]
+  static let subsystem = "com.grimridge.PingPlace"
+}
 
-    private var cachedInitialPosition: CGPoint?
-    private var cachedInitialWindowSize: CGSize?
-    private var cachedInitialNotifSize: CGSize?
-    private var cachedInitialPadding: CGFloat?
+private enum DefaultsKey {
+  static let menuBarIconHidden = "isMenuBarIconHidden"
+  static let notificationPosition = "notificationPosition"
+  static let debugLoggingEnabled = "debugLoggingEnabled"
+}
 
-    private var widgetMonitorTimer: Timer?
-    private var lastWidgetWindowCount: Int = 0
-    private var pollingEndTime: Date?
+private enum LogLevel: String {
+  case info = "INFO"
+  case debug = "DEBUG"
+  case error = "ERROR"
+}
 
-    private var currentPosition: NotificationPosition = {
-        guard let rawValue: String = UserDefaults.standard.string(forKey: "notificationPosition"),
-              let position = NotificationPosition(rawValue: rawValue)
-        else {
-            return .topMiddle
-        }
-        return position
-    }()
+extension AXUIElement {
+  fileprivate func attribute<T>(_ name: String, as _: T.Type = T.self) -> T? {
+    var value: AnyObject?
+    guard AXUIElementCopyAttributeValue(self, name as CFString, &value) == .success else {
+      return nil
+    }
+    return value as? T
+  }
 
-    private func debugLog(_ message: String) {
-        guard debugMode else { return }
-        logger.info("\(message, privacy: .public)")
+  fileprivate func point(for attributeName: String) -> CGPoint? {
+    guard
+      let value = attribute(attributeName, as: AXValue.self),
+      AXValueGetType(value) == .cgPoint
+    else {
+      return nil
+    }
+    var point = CGPoint.zero
+    AXValueGetValue(value, .cgPoint, &point)
+    return point
+  }
+
+  fileprivate func size(for attributeName: String) -> CGSize? {
+    guard
+      let value = attribute(attributeName, as: AXValue.self),
+      AXValueGetType(value) == .cgSize
+    else {
+      return nil
+    }
+    var size = CGSize.zero
+    AXValueGetValue(value, .cgSize, &size)
+    return size
+  }
+
+  fileprivate func frame() -> CGRect? {
+    guard let origin = point(for: kAXPositionAttribute), let size = size(for: kAXSizeAttribute)
+    else {
+      return nil
+    }
+    return CGRect(origin: origin, size: size)
+  }
+
+  fileprivate func isSettable(_ attribute: String) -> Bool {
+    var settable: DarwinBoolean = false
+    let result = AXUIElementIsAttributeSettable(self, attribute as CFString, &settable)
+    return result == .success && settable.boolValue
+  }
+
+  fileprivate func setPosition(_ point: CGPoint) -> AXError {
+    var point = point
+    guard let value = AXValueCreate(.cgPoint, &point) else { return .failure }
+    return AXUIElementSetAttributeValue(self, kAXPositionAttribute as CFString, value)
+  }
+
+  fileprivate func children() -> [AXUIElement] {
+    let direct = attribute(kAXChildrenAttribute, as: [AXUIElement].self) ?? []
+    let ordered = attribute(AppConstants.orderedChildrenAttribute, as: [AXUIElement].self) ?? []
+    var seen = Set<ObjectIdentifier>()
+    return (direct + ordered).filter { seen.insert(ObjectIdentifier($0)).inserted }
+  }
+
+  fileprivate func firstDescendant(where predicate: (AXUIElement) -> Bool) -> AXUIElement? {
+    if predicate(self) { return self }
+    for child in children() {
+      if let match = child.firstDescendant(where: predicate) { return match }
+    }
+    return nil
+  }
+}
+
+extension AXError {
+  fileprivate var name: String {
+    switch self {
+    case .success: "success"
+    case .failure: "failure"
+    case .illegalArgument: "illegalArgument"
+    case .invalidUIElement: "invalidUIElement"
+    case .invalidUIElementObserver: "invalidUIElementObserver"
+    case .cannotComplete: "cannotComplete"
+    case .attributeUnsupported: "attributeUnsupported"
+    case .actionUnsupported: "actionUnsupported"
+    case .notificationUnsupported: "notificationUnsupported"
+    case .notImplemented: "notImplemented"
+    case .notificationAlreadyRegistered: "notificationAlreadyRegistered"
+    case .notificationNotRegistered: "notificationNotRegistered"
+    case .apiDisabled: "apiDisabled"
+    case .noValue: "noValue"
+    case .parameterizedAttributeUnsupported: "parameterizedAttributeUnsupported"
+    case .notEnoughPrecision: "notEnoughPrecision"
+    @unknown default: "unknown(\(rawValue))"
+    }
+  }
+}
+
+extension Logger {
+  fileprivate static let app = Logger(subsystem: AppConstants.subsystem, category: "app")
+}
+
+private func axObserverCallback(
+  _: AXObserver, _ element: AXUIElement, _ notification: CFString,
+  _ refcon: UnsafeMutableRawPointer?
+) {
+  guard let refcon else { return }
+  let appDelegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+  appDelegate.handleAXNotification(notification as String, element: element)
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+  private var axObserver: AXObserver?
+  private var statusItem: NSStatusItem?
+  private var observedWindowKeys = Set<String>()
+  private var originalWindowOrigin: CGPoint?
+  private var windowIsShifted = false
+  private var baselineWindowFrame: CGRect?
+  private var baselineBannerFrame: CGRect?
+
+  private let logger = Logger.app
+  private let logFileURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Logs/PingPlace.log")
+  private var isIconHidden = UserDefaults.standard.bool(forKey: DefaultsKey.menuBarIconHidden)
+  private var isDebugLoggingEnabled: Bool {
+    UserDefaults.standard.bool(forKey: DefaultsKey.debugLoggingEnabled)
+  }
+
+  private var currentPosition: NotificationPosition = {
+    UserDefaults.standard.string(forKey: DefaultsKey.notificationPosition)
+      .flatMap(NotificationPosition.init(rawValue:)) ?? .topMiddle
+  }()
+
+  func launch() {
+    prepareLogFile()
+    info("Launch started")
+    guard requestAccessibilityIfNeeded() else {
+      NSApp.terminate(nil)
+      return
+    }
+    setupAXObserver()
+    if !isIconHidden { setupStatusItem() }
+    moveAll()
+  }
+
+  func applicationWillBecomeActive(_: Notification) {
+    guard isIconHidden else { return }
+    isIconHidden = false
+    UserDefaults.standard.set(false, forKey: DefaultsKey.menuBarIconHidden)
+    setupStatusItem()
+  }
+
+  private func requestAccessibilityIfNeeded() -> Bool {
+    let options =
+      [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+    return AXIsProcessTrustedWithOptions(options)
+  }
+
+  private var notificationCenterApp: NSRunningApplication? {
+    NSWorkspace.shared.runningApplications.first {
+      $0.bundleIdentifier == AppConstants.notificationCenterBundleID
+    }
+  }
+
+  private var notificationCenterElement: AXUIElement? {
+    notificationCenterApp.map { AXUIElementCreateApplication($0.processIdentifier) }
+  }
+
+  private func setupAXObserver() {
+    guard let app = notificationCenterApp, let appElement = notificationCenterElement else {
+      info("Notification Center not running")
+      return
     }
 
-    func applicationDidFinishLaunching(_: Notification) {
-        checkAccessibilityPermissions()
-        setupObserver()
-        if !isMenuBarIconHidden {
-            setupStatusItem()
-        }
-        moveAllNotifications()
+    var obs: AXObserver?
+    guard AXObserverCreate(app.processIdentifier, axObserverCallback, &obs) == .success, let obs
+    else {
+      error("Failed to create AXObserver")
+      return
     }
 
-    func applicationWillBecomeActive(_: Notification) {
-        guard isMenuBarIconHidden else { return }
-        isMenuBarIconHidden = false
-        UserDefaults.standard.set(false, forKey: "isMenuBarIconHidden")
-        setupStatusItem()
+    axObserver = obs
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), .defaultMode)
+
+    register(
+      kAXWindowCreatedNotification as String, for: appElement, label: "Notification Center app")
+    register(
+      AppConstants.childrenChangedNotification, for: appElement, label: "Notification Center app")
+    refreshWindowObservers()
+    info("AXObserver ready for Notification Center pid=\(app.processIdentifier)")
+  }
+
+  private var notificationCenterWindows: [AXUIElement] {
+    notificationCenterElement?.attribute(kAXWindowsAttribute, as: [AXUIElement].self) ?? []
+  }
+
+  private func register(_ notification: String, for element: AXUIElement, label: String) {
+    guard let axObserver else { return }
+    let result = AXObserverAddNotification(
+      axObserver, element, notification as CFString, Unmanaged.passUnretained(self).toOpaque())
+
+    switch result {
+    case .success, .notificationAlreadyRegistered:
+      debug("Registered \(notification) for \(label)")
+    case .notificationUnsupported:
+      debug("Notification unsupported \(notification) for \(label)")
+    default:
+      error("Failed to register \(notification) for \(label) result=\(result.name)")
     }
+  }
 
-    private func checkAccessibilityPermissions() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
-            let alert = NSAlert()
-            alert.messageText = "Accessibility Permission Required"
-            alert.informativeText = "PingPlace needs accessibility permission to detect and move notifications.\n\nPlease grant permission in System Settings and restart the app."
-            alert.addButton(withTitle: "Open System Settings")
-            alert.addButton(withTitle: "Quit")
-
-            if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-            }
-            NSApplication.shared.terminate(nil)
-            return
-        }
+  private func refreshWindowObservers() {
+    for window in notificationCenterWindows {
+      let key = observerKey(for: window)
+      guard observedWindowKeys.insert(key).inserted else { continue }
+      register(
+        AppConstants.childrenChangedNotification, for: window, label: "Notification Center window")
+      register(kAXCreatedNotification as String, for: window, label: "Notification Center window")
+      register(
+        kAXUIElementDestroyedNotification as String, for: window,
+        label: "Notification Center window")
     }
+  }
 
-    func setupStatusItem() {
-        guard !isMenuBarIconHidden else {
-            statusItem = nil
-            return
-        }
+  private func observerKey(for window: AXUIElement) -> String {
+    let role = window.attribute(kAXRoleAttribute, as: String.self) ?? "?"
+    let subrole = window.attribute(kAXSubroleAttribute, as: String.self) ?? "?"
+    let position = window.point(for: kAXPositionAttribute) ?? .zero
+    let size = window.size(for: kAXSizeAttribute) ?? .zero
+    return "\(role)|\(subrole)|\(position.x)|\(position.y)|\(size.width)|\(size.height)"
+  }
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button: NSStatusBarButton = statusItem?.button, let menuBarIcon = NSImage(named: "MenuBarIcon") {
-            menuBarIcon.isTemplate = true
-            button.image = menuBarIcon
-        }
-        statusItem?.menu = createMenu()
-    }
+  fileprivate func handleAXNotification(_ notification: String, element: AXUIElement) {
+    debug("Observed \(notification) on \(summary(for: element))")
+    refreshWindowObservers()
+    moveAll()
+  }
 
-    private func createMenu() -> NSMenu {
-        let menu = NSMenu()
-
-        for position: NotificationPosition in NotificationPosition.allCases {
-            let item = NSMenuItem(title: position.displayName, action: #selector(changePosition(_:)), keyEquivalent: "")
-            item.representedObject = position
-            item.state = position == currentPosition ? .on : .off
-            menu.addItem(item)
-        }
-
-        menu.addItem(NSMenuItem.separator())
-
-        let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
-        launchItem.state = FileManager.default.fileExists(atPath: launchAgentPlistPath) ? .on : .off
-        menu.addItem(launchItem)
-
-        menu.addItem(NSMenuItem(title: "Hide Menu Bar Icon", action: #selector(toggleMenuBarIcon(_:)), keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-
-        let donateMenu = NSMenuItem(title: "Donate", action: nil, keyEquivalent: "")
-        let donateSubmenu = NSMenu()
-        donateSubmenu.addItem(NSMenuItem(title: "Ko-fi", action: #selector(openKofi), keyEquivalent: ""))
-        donateSubmenu.addItem(NSMenuItem(title: "Buy Me a Coffee", action: #selector(openBuyMeACoffee), keyEquivalent: ""))
-        donateMenu.submenu = donateSubmenu
-
-        menu.addItem(NSMenuItem(title: "About", action: #selector(showAbout), keyEquivalent: ""))
-        menu.addItem(donateMenu)
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-
-        return menu
-    }
-
-    @objc private func openKofi() {
-        NSWorkspace.shared.open(URL(string: "https://ko-fi.com/wadegrimridge")!)
-    }
-
-    @objc private func openBuyMeACoffee() {
-        NSWorkspace.shared.open(URL(string: "https://www.buymeacoffee.com/wadegrimridge")!)
-    }
-
-    @objc private func toggleMenuBarIcon(_: NSMenuItem) {
-        let alert = NSAlert()
-        alert.messageText = "Hide Menu Bar Icon"
-        alert.informativeText = "The menu bar icon will be hidden. To show it again, launch PingPlace again."
-        alert.addButton(withTitle: "Hide Icon")
-        alert.addButton(withTitle: "Cancel")
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        isMenuBarIconHidden = true
-        UserDefaults.standard.set(true, forKey: "isMenuBarIconHidden")
-        statusItem = nil
-    }
-
-    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
-        let isEnabled = FileManager.default.fileExists(atPath: launchAgentPlistPath)
-
-        if isEnabled {
-            do {
-                try FileManager.default.removeItem(atPath: launchAgentPlistPath)
-                sender.state = .off
-            } catch {
-                showError("Failed to disable launch at login: \(error.localizedDescription)")
-            }
-        } else {
-            let plistContent = """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key>
-                <string>com.grimridge.PingPlace</string>
-                <key>ProgramArguments</key>
-                <array>
-                    <string>\(Bundle.main.executablePath!)</string>
-                </array>
-                <key>RunAtLoad</key>
-                <true/>
-            </dict>
-            </plist>
-            """
-            do {
-                try plistContent.write(toFile: launchAgentPlistPath, atomically: true, encoding: .utf8)
-                sender.state = .on
-            } catch {
-                showError("Failed to enable launch at login: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    private func showError(_ message: String) {
-        let alert = NSAlert()
-        alert.messageText = "Error"
-        alert.informativeText = message
-        alert.runModal()
-    }
-
-    @objc private func changePosition(_ sender: NSMenuItem) {
-        guard let position: NotificationPosition = sender.representedObject as? NotificationPosition else { return }
-        let oldPosition: NotificationPosition = currentPosition
-        currentPosition = position
-        UserDefaults.standard.set(position.rawValue, forKey: "notificationPosition")
-
-        sender.menu?.items.forEach { item in
-            item.state = (item.representedObject as? NotificationPosition) == position ? .on : .off
-        }
-
-        debugLog("Position changed: \(oldPosition.displayName) → \(position.displayName)")
-        moveAllNotifications()
-    }
-
-    private func cacheInitialNotificationData(windowSize: CGSize, notifSize: CGSize, position: CGPoint) {
-        guard cachedInitialPosition == nil else { return }
-
-        let screenWidth: CGFloat = NSScreen.main!.frame.width
-        var padding: CGFloat
-        var effectivePosition = position
-
-        if position.x + notifSize.width > screenWidth {
-            debugLog("Detected incorrect initial position.x: \(position.x). Recalculating position.")
-            padding = 16.0
-            effectivePosition.x = screenWidth - notifSize.width - padding
-        } else {
-            let rightEdge: CGFloat = position.x + notifSize.width
-            padding = screenWidth - rightEdge
-        }
-
-        cachedInitialPosition = effectivePosition
-        cachedInitialWindowSize = windowSize
-        cachedInitialNotifSize = notifSize
-        cachedInitialPadding = padding
-
-        debugLog("Initial notification cached - size: \(notifSize), position: \(effectivePosition), padding: \(padding)")
-    }
-
-    func moveNotification(_ window: AXUIElement) {
-        guard currentPosition != .topRight else { return }
-
-        // if let identifier: String = getWindowIdentifier(window), identifier.hasPrefix("widget") {
-        //     return
-        // }
-
-        if hasNotificationCenterUI() {
-            debugLog("Skipping move - Notification Center UI detected")
-            return
-        }
-
-        let targetSubroles: [String] = ["AXNotificationCenterBanner", "AXNotificationCenterAlert"]
-        guard let windowSize: CGSize = getSize(of: window),
-              let bannerContainer: AXUIElement = findElementWithSubrole(root: window, targetSubroles: targetSubroles),
-              let notifSize: CGSize = getSize(of: bannerContainer),
-              let position: CGPoint = getPosition(of: bannerContainer)
-        else {
-            debugLog("Failed to get notification dimensions or find banner container")
-            return
-        }
-
-        if cachedInitialPosition == nil {
-            cacheInitialNotificationData(windowSize: windowSize, notifSize: notifSize, position: position)
-        } else if position != cachedInitialPosition {
-            setPosition(window, x: cachedInitialPosition!.x, y: cachedInitialPosition!.y)
-        }
-
-        let newPosition: (x: CGFloat, y: CGFloat) = calculateNewPosition(
-            windowSize: cachedInitialWindowSize!,
-            notifSize: cachedInitialNotifSize!,
-            position: cachedInitialPosition!,
-            padding: cachedInitialPadding!
-        )
-
-        setPosition(window, x: newPosition.x, y: newPosition.y)
-
-        pollingEndTime = Date().addingTimeInterval(6.5)
-        debugLog("Moved notification to \(currentPosition.displayName) at (\(newPosition.x), \(newPosition.y))")
-    }
-
-    private func moveAllNotifications() {
-        guard let pid: pid_t = NSWorkspace.shared.runningApplications.first(where: {
-            $0.bundleIdentifier == notificationCenterBundleID
-        })?.processIdentifier else {
-            debugLog("Cannot find Notification Center process")
-            return
-        }
-
-        let app: AXUIElement = AXUIElementCreateApplication(pid)
-        var windowsRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
-              let windows: [AXUIElement] = windowsRef as? [AXUIElement]
-        else {
-            debugLog("Failed to get notification windows")
-            return
-        }
-
-        for window in windows {
-            moveNotification(window)
-        }
-    }
-
-    @objc func showAbout() {
-        let aboutWindow = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 300, height: 300),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
-        aboutWindow.center()
-        aboutWindow.title = "About PingPlace"
-        aboutWindow.delegate = self
-
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 180))
-
-        let version: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "N/A"
-        let copyright: String = Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String ?? ""
-
-        let elements: [(NSView, CGFloat)] = [
-            (createIconView(), 165),
-            (createLabel("PingPlace", font: .boldSystemFont(ofSize: 16)), 110),
-            (createLabel("Version \(version)"), 90),
-            (createLabel("Made with <3 by Wade"), 70),
-            (createTwitterButton(), 40),
-            (createLabel(copyright, color: .secondaryLabelColor, size: 11), 20),
-        ]
-
-        for (view, y) in elements {
-            view.frame = NSRect(x: 0, y: y, width: 300, height: 20)
-            if view is NSImageView {
-                view.frame = NSRect(x: 100, y: y, width: 100, height: 100)
-            }
-            contentView.addSubview(view)
-        }
-
-        aboutWindow.contentView = contentView
-        aboutWindow.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private func createIconView() -> NSImageView {
-        let iconImageView = NSImageView()
-        if let iconImage = NSImage(named: "icon") {
-            iconImageView.image = iconImage
-            iconImageView.imageScaling = .scaleProportionallyDown
-        }
-        return iconImageView
-    }
-
-    private func createLabel(_ text: String, font: NSFont = .systemFont(ofSize: 12), color: NSColor = .labelColor, size _: CGFloat = 12) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
-        label.alignment = .center
-        label.font = font
-        label.textColor = color
-        return label
-    }
-
-    private func createTwitterButton() -> NSButton {
-        let button = NSButton()
-        button.title = "@WadeGrimridge"
-        button.bezelStyle = .inline
-        button.isBordered = false
-        button.target = self
-        button.action = #selector(openTwitter)
-        button.attributedTitle = NSAttributedString(string: "@WadeGrimridge", attributes: [
-            .foregroundColor: NSColor.linkColor,
-            .underlineStyle: NSUnderlineStyle.single.rawValue,
-        ])
-        return button
-    }
-
-    @objc private func openTwitter() {
-        NSWorkspace.shared.open(URL(string: "https://x.com/WadeGrimridge")!)
-    }
-
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
+  private func banner(in root: AXUIElement) -> AXUIElement? {
+    root.firstDescendant { element in
+      guard let subrole = element.attribute(kAXSubroleAttribute, as: String.self) else {
         return false
+      }
+      return AppConstants.bannerSubroles.contains(subrole)
+    }
+  }
+
+  private func ncPanelIsOpen(in root: AXUIElement) -> Bool {
+    root.firstDescendant { element in
+      element.attribute(kAXIdentifierAttribute, as: String.self)
+        == AppConstants.widgetEditorButtonIdentifier
+    } != nil
+  }
+
+  private func summary(for element: AXUIElement) -> String {
+    let role = element.attribute(kAXRoleAttribute, as: String.self) ?? "?"
+    let subrole = element.attribute(kAXSubroleAttribute, as: String.self) ?? "?"
+    let title = element.attribute(kAXTitleAttribute, as: String.self) ?? ""
+    return "role=\(role) subrole=\(subrole) title=\(title)"
+  }
+
+  private func move(_ window: AXUIElement) {
+    if ncPanelIsOpen(in: window) {
+      restoreWindowIfNeeded(window, reason: "Notification Center panel opened")
+      debug("Skipping Notification Center panel state")
+      return
     }
 
-    func setupObserver() {
-        guard let pid: pid_t = NSWorkspace.shared.runningApplications.first(where: {
-            $0.bundleIdentifier == notificationCenterBundleID
-        })?.processIdentifier else {
-            debugLog("Failed to setup observer - Notification Center not found")
-            return
-        }
-
-        let app: AXUIElement = AXUIElementCreateApplication(pid)
-        var observer: AXObserver?
-        AXObserverCreate(pid, observerCallback, &observer)
-        axObserver = observer
-
-        let selfPtr: UnsafeMutableRawPointer = Unmanaged.passUnretained(self).toOpaque()
-        AXObserverAddNotification(observer!, app, kAXWindowCreatedNotification as CFString, selfPtr)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer!), .defaultMode)
-
-        debugLog("Observer setup complete for Notification Center (PID: \(pid))")
-
-        widgetMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
-            self.checkForWidgetChanges()
-        }
+    guard
+      let banner = banner(in: window),
+      let bannerFrame = banner.frame(),
+      let windowFrame = window.frame()
+    else {
+      restoreWindowIfNeeded(window, reason: "No banner visible")
+      debug("Skipping window without banner")
+      return
     }
 
-    private func getWindowIdentifier(_ element: AXUIElement) -> String? {
-        var identifierRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &identifierRef) == .success else {
-            return nil
-        }
-        return identifierRef as? String
+    guard window.isSettable(kAXPositionAttribute) else {
+      debug("Notification Center window position not settable")
+      return
     }
 
-    private func checkForWidgetChanges() {
-        guard let pollingEnd: Date = pollingEndTime, Date() < pollingEnd else {
-            return
-        }
-
-        let hasNCUI: Bool = hasNotificationCenterUI()
-        let currentNCState: Int = hasNCUI ? 1 : 0
-
-        if lastWidgetWindowCount != currentNCState {
-            debugLog("Notification Center state changed (\(lastWidgetWindowCount) → \(currentNCState)) - triggering move")
-            if !hasNCUI {
-                moveAllNotifications()
-            }
-        }
-
-        lastWidgetWindowCount = currentNCState
+    if baselineWindowFrame == nil || baselineBannerFrame == nil {
+      originalWindowOrigin = windowFrame.origin
+      baselineWindowFrame = windowFrame
+      baselineBannerFrame = bannerFrame
+      debug(
+        "Captured baseline window=\(NSStringFromRect(windowFrame)) banner=\(NSStringFromRect(bannerFrame))"
+      )
     }
 
-    private func hasNotificationCenterUI() -> Bool {
-        guard let pid: pid_t = NSWorkspace.shared.runningApplications.first(where: {
-            $0.bundleIdentifier == notificationCenterBundleID
-        })?.processIdentifier else { return false }
-
-        let app: AXUIElement = AXUIElementCreateApplication(pid)
-        return findElementWithWidgetIdentifier(root: app) != nil
+    guard
+      let target = targetOrigin(
+        for: baselineWindowFrame ?? windowFrame,
+        bannerFrame: baselineBannerFrame ?? bannerFrame
+      )
+    else {
+      debug("Skipping window without containing screen for banner")
+      return
     }
 
-    private func findElementWithWidgetIdentifier(root: AXUIElement) -> AXUIElement? {
-        if let identifier: String = getWindowIdentifier(root), identifier.hasPrefix("widget-local") {
-            return root
-        }
+    let result = window.setPosition(target)
+    let updatedFrame = window.frame()
+    windowIsShifted = result == .success
+    debug(
+      "Set window position result=\(result.name) target=\(NSStringFromPoint(target)) after=\(updatedFrame.map(NSStringFromRect) ?? "nil")"
+    )
+  }
 
-        var childrenRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(root, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children: [AXUIElement] = childrenRef as? [AXUIElement] else { return nil }
+  private func moveAll() {
+    notificationCenterWindows.forEach(move)
+  }
 
-        for child: AXUIElement in children {
-            if let found: AXUIElement = findElementWithWidgetIdentifier(root: child) {
-                return found
-            }
-        }
-        return nil
+  private func restoreWindowIfNeeded(_ window: AXUIElement, reason: String) {
+    guard windowIsShifted, let originalOrigin = originalWindowOrigin else { return }
+    let result = window.setPosition(originalOrigin)
+    let updatedFrame = window.frame()
+    debug(
+      "Restored window position reason=\(reason) result=\(result.name) target=\(NSStringFromPoint(originalOrigin)) after=\(updatedFrame.map(NSStringFromRect) ?? "nil")"
+    )
+    if result == .success {
+      windowIsShifted = false
+      originalWindowOrigin = nil
+      baselineWindowFrame = nil
+      baselineBannerFrame = nil
+    }
+  }
+
+  private func containingScreen(for windowFrame: CGRect) -> NSScreen? {
+    let globalTopY = NSScreen.screens.map(\.frame.maxY).max() ?? 0
+    let appKitPoint = CGPoint(
+      x: windowFrame.midX,
+      y: globalTopY - (windowFrame.minY + windowFrame.height / 2)
+    )
+    return NSScreen.screens.first { $0.frame.contains(appKitPoint) }
+  }
+
+  private func targetOrigin(for windowFrame: CGRect, bannerFrame: CGRect) -> CGPoint? {
+    guard let screen = containingScreen(for: windowFrame) else { return nil }
+    let screenFrame = screen.frame
+    let visibleFrame = screen.visibleFrame
+
+    let localBannerX = max(
+      0, windowFrame.width - bannerFrame.width - AppConstants.bannerRightPadding)
+    let rightPadding = max(0, windowFrame.width - (localBannerX + bannerFrame.width))
+
+    let x: CGFloat
+    switch currentPosition {
+    case .topLeft, .middleLeft, .bottomLeft:
+      x = rightPadding - localBannerX
+    case .topMiddle, .deadCenter, .bottomMiddle:
+      x = screenFrame.minX + (screenFrame.width - bannerFrame.width) / 2 - localBannerX
+    case .topRight, .middleRight, .bottomRight:
+      x = 0
     }
 
-    private func getPosition(of element: AXUIElement) -> CGPoint? {
-        var positionValue: AnyObject?
-        AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue)
-        guard let posVal: AnyObject = positionValue, AXValueGetType(posVal as! AXValue) == .cgPoint else {
-            return nil
-        }
-        var position = CGPoint.zero
-        AXValueGetValue(posVal as! AXValue, .cgPoint, &position)
-        return position
+    let dockSize = screenFrame.height - visibleFrame.height
+    let y: CGFloat
+    switch currentPosition {
+    case .topLeft, .topMiddle, .topRight:
+      y = 0
+    case .middleLeft, .deadCenter, .middleRight:
+      y = (windowFrame.height - bannerFrame.height) / 2 - dockSize - AppConstants.dockPadding
+    case .bottomLeft, .bottomMiddle, .bottomRight:
+      y = windowFrame.height - bannerFrame.height - dockSize - AppConstants.dockPadding
     }
 
-    private func calculateNewPosition(
-        windowSize: CGSize,
-        notifSize: CGSize,
-        position: CGPoint,
-        padding: CGFloat
-    ) -> (x: CGFloat, y: CGFloat) {
-        debugLog("Calculating new position with windowSize: \(windowSize), notifSize: \(notifSize), position: \(position), padding: \(padding)")
-        let newX: CGFloat
-        let newY: CGFloat
+    debug(
+      "targetOrigin position=\(currentPosition.rawValue) window=\(NSStringFromRect(windowFrame)) banner=\(NSStringFromRect(bannerFrame)) screen=\(NSStringFromRect(screenFrame)) visible=\(NSStringFromRect(visibleFrame)) localBannerX=\(localBannerX) rightPadding=\(rightPadding) target=\(NSStringFromPoint(CGPoint(x: x, y: y)))"
+    )
 
-        switch currentPosition {
-        case .topLeft, .middleLeft, .bottomLeft:
-            newX = padding - position.x
-        case .topMiddle, .bottomMiddle, .deadCenter:
-            newX = (windowSize.width - notifSize.width) / 2 - position.x
-        case .topRight, .middleRight, .bottomRight:
-            newX = 0
-        }
+    return CGPoint(x: x, y: y)
+  }
 
-        switch currentPosition {
-        case .topLeft, .topMiddle, .topRight:
-            newY = 0
-        case .middleLeft, .middleRight, .deadCenter:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = (windowSize.height - notifSize.height) / 2 - dockSize
-        case .bottomLeft, .bottomMiddle, .bottomRight:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = windowSize.height - notifSize.height - dockSize - paddingAboveDock
-        }
+  private func setupStatusItem() {
+    statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    if let btn = statusItem?.button, let icon = NSImage(named: "MenuBarIcon") {
+      icon.isTemplate = true
+      icon.size = NSSize(width: 18, height: 18)
+      btn.image = icon
+      btn.imagePosition = .imageOnly
+      btn.imageScaling = .scaleProportionallyDown
+    }
+    statusItem?.menu = buildMenu()
+  }
 
-        debugLog("Calculated new position - x: \(newX), y: \(newY)")
-        return (newX, newY)
+  private func buildMenu() -> NSMenu {
+    let menu = NSMenu()
+    for pos in NotificationPosition.allCases {
+      let item = NSMenuItem(
+        title: pos.displayName, action: #selector(selectPosition(_:)), keyEquivalent: "")
+      item.representedObject = pos
+      item.state = pos == currentPosition ? .on : .off
+      menu.addItem(item)
+    }
+    menu.addItem(.separator())
+    let loginItem = NSMenuItem(
+      title: "Launch at Login", action: #selector(toggleLoginItem(_:)), keyEquivalent: "")
+    loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    menu.addItem(loginItem)
+    menu.addItem(
+      NSMenuItem(title: "Hide Menu Bar Icon", action: #selector(hideIcon), keyEquivalent: ""))
+    menu.addItem(.separator())
+
+    let donate = NSMenuItem(title: "Donate", action: nil, keyEquivalent: "")
+    let dm = NSMenu()
+    dm.addItem(
+      NSMenuItem(title: "Ko-fi", action: #selector(openDonationLink(_:)), keyEquivalent: ""))
+    dm.addItem(
+      NSMenuItem(
+        title: "Buy Me a Coffee", action: #selector(openDonationLink(_:)), keyEquivalent: ""))
+    donate.submenu = dm
+    menu.addItem(donate)
+
+    menu.addItem(NSMenuItem(title: "About", action: #selector(showAbout), keyEquivalent: ""))
+    menu.addItem(
+      NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: ""))
+    return menu
+  }
+
+  @objc private func selectPosition(_ sender: NSMenuItem) {
+    guard let pos = sender.representedObject as? NotificationPosition else { return }
+    currentPosition = pos
+    UserDefaults.standard.set(pos.rawValue, forKey: DefaultsKey.notificationPosition)
+    sender.menu?.items.forEach {
+      $0.state = ($0.representedObject as? NotificationPosition) == pos ? .on : .off
+    }
+    moveAll()
+  }
+
+  @objc private func toggleLoginItem(_ sender: NSMenuItem) {
+    do {
+      if SMAppService.mainApp.status == .enabled {
+        try SMAppService.mainApp.unregister()
+        sender.state = .off
+      } else {
+        try SMAppService.mainApp.register()
+        sender.state = .on
+      }
+    } catch {
+      let a = NSAlert()
+      a.messageText = "Error"
+      a.informativeText = error.localizedDescription
+      a.runModal()
+    }
+  }
+
+  @objc private func hideIcon() {
+    let alert = NSAlert()
+    alert.messageText = "Hide Menu Bar Icon"
+    alert.informativeText = "The menu bar icon will be hidden. Launch PingPlace again to show it."
+    alert.addButton(withTitle: "Hide Icon")
+    alert.addButton(withTitle: "Cancel")
+    guard alert.runModal() == .alertFirstButtonReturn else { return }
+    isIconHidden = true
+    UserDefaults.standard.set(true, forKey: DefaultsKey.menuBarIconHidden)
+    statusItem = nil
+  }
+
+  @objc private func openDonationLink(_ sender: NSMenuItem) {
+    let urls = [
+      "Ko-fi": "https://ko-fi.com/wadegrimridge",
+      "Buy Me a Coffee": "https://www.buymeacoffee.com/wadegrimridge",
+    ]
+    if let url = urls[sender.title].flatMap(URL.init) { NSWorkspace.shared.open(url) }
+  }
+
+  @objc private func showAbout() {
+    let windowWidth: CGFloat = 320
+    let windowHeight: CGFloat = 220
+    let horizontalPadding: CGFloat = 24
+    let iconSize: CGFloat = 80
+    let titleHeight: CGFloat = 22
+    let lineHeight: CGFloat = 18
+    let linkHeight: CGFloat = 20
+    let copyrightHeight: CGFloat = 16
+
+    let win = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight),
+      styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    win.title = "About PingPlace"
+    win.center()
+    win.delegate = self
+
+    let content = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
+    let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "N/A"
+    let copyright = Bundle.main.infoDictionary?["NSHumanReadableCopyright"] as? String ?? ""
+
+    let contentWidth = windowWidth - (horizontalPadding * 2)
+    let footerSpacing: CGFloat = 4
+    let lineSpacing: CGFloat = 2
+    let titleSpacing: CGFloat = 6
+
+    let contentStackHeight =
+      copyrightHeight + footerSpacing +
+      linkHeight + lineSpacing +
+      lineHeight + lineSpacing +
+      lineHeight + lineSpacing +
+      titleHeight + titleSpacing +
+      iconSize
+    let verticalPadding = max(12, floor((windowHeight - contentStackHeight) / 2))
+
+    let copyrightY = verticalPadding
+    let linkY = copyrightY + copyrightHeight + footerSpacing
+    let subtitleY = linkY + linkHeight + lineSpacing
+    let versionY = subtitleY + lineHeight + lineSpacing
+    let titleY = versionY + lineHeight + lineSpacing
+    let iconY = titleY + titleHeight + titleSpacing
+
+    let views: [(NSView, NSRect)] = [
+      (
+        {
+          let v = NSImageView()
+          v.image = NSApp.applicationIconImage
+          v.imageScaling = .scaleProportionallyDown
+          return v
+        }(),
+        NSRect(x: (windowWidth - iconSize) / 2, y: iconY, width: iconSize, height: iconSize)
+      ),
+
+      (
+        {
+          let f = NSTextField(labelWithString: "PingPlace")
+          f.alignment = .center
+          f.font = .boldSystemFont(ofSize: 16)
+          return f
+        }(),
+        NSRect(x: horizontalPadding, y: titleY, width: contentWidth, height: titleHeight)
+      ),
+
+      (
+        {
+          let f = NSTextField(labelWithString: "Version \(version)")
+          f.alignment = .center
+          return f
+        }(),
+        NSRect(x: horizontalPadding, y: versionY, width: contentWidth, height: lineHeight)
+      ),
+
+      (
+        {
+          let f = NSTextField(labelWithString: "Made with <3")
+          f.alignment = .center
+          return f
+        }(),
+        NSRect(x: horizontalPadding, y: subtitleY, width: contentWidth, height: lineHeight)
+      ),
+
+      (
+        {
+          let b = NSButton()
+          b.title = "@WadeGrimridge"
+          b.bezelStyle = .inline
+          b.isBordered = false
+          b.target = self
+          b.action = #selector(openTwitter)
+          b.attributedTitle = NSAttributedString(
+            string: "@WadeGrimridge",
+            attributes: [
+              .foregroundColor: NSColor.linkColor,
+              .underlineStyle: NSUnderlineStyle.single.rawValue,
+            ])
+          return b
+        }(),
+        NSRect(x: horizontalPadding, y: linkY, width: contentWidth, height: linkHeight)
+      ),
+
+      (
+        {
+          let f = NSTextField(labelWithString: copyright)
+          f.alignment = .center
+          f.font = .systemFont(ofSize: 10)
+          f.textColor = .secondaryLabelColor
+          return f
+        }(),
+        NSRect(x: horizontalPadding, y: copyrightY, width: contentWidth, height: copyrightHeight)
+      ),
+    ]
+
+    for (view, frame) in views {
+      view.frame = frame
+      content.addSubview(view)
     }
 
-    private func getWindowTitle(_ element: AXUIElement) -> String? {
-        var titleRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef) == .success else {
-            return nil
-        }
-        return titleRef as? String
+    win.contentView = content
+    win.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+
+  @objc private func quitApp() {
+    NSApp.terminate(nil)
+  }
+
+  @objc private func openTwitter() {
+    NSWorkspace.shared.open(URL(string: "https://x.com/WadeGrimridge")!)
+  }
+
+  // MARK: NSWindowDelegate
+
+  func windowShouldClose(_ sender: NSWindow) -> Bool {
+    sender.orderOut(nil)
+    return false
+  }
+
+  private func info(_ message: String) {
+    log(.info, message)
+  }
+
+  private func debug(_ message: String) {
+    guard isDebugLoggingEnabled else { return }
+    log(.debug, message)
+  }
+
+  private func error(_ message: String) {
+    log(.error, message)
+  }
+
+  private func prepareLogFile() {
+    let directoryURL = logFileURL.deletingLastPathComponent()
+    try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+    if !FileManager.default.fileExists(atPath: logFileURL.path) {
+      FileManager.default.createFile(atPath: logFileURL.path, contents: nil)
+    }
+  }
+
+  private func log(_ level: LogLevel, _ message: String) {
+    switch level {
+    case .info:
+      logger.info("\(message, privacy: .public)")
+    case .debug:
+      logger.debug("\(message, privacy: .public)")
+    case .error:
+      logger.error("\(message, privacy: .public)")
     }
 
-    private func getSize(of element: AXUIElement) -> CGSize? {
-        var sizeValue: AnyObject?
-        AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue)
-        guard let sizeVal: AnyObject = sizeValue, AXValueGetType(sizeVal as! AXValue) == .cgSize else {
-            return nil
-        }
-        var size = CGSize.zero
-        AXValueGetValue(sizeVal as! AXValue, .cgSize, &size)
-        return size
-    }
-
-    private func setPosition(_ element: AXUIElement, x: CGFloat, y: CGFloat) {
-        var point = CGPoint(x: x, y: y)
-        let value: AXValue = AXValueCreate(.cgPoint, &point)!
-        AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value)
-    }
-
-    private func findElementWithSubrole(root: AXUIElement, targetSubroles: [String]) -> AXUIElement? {
-        var subroleRef: AnyObject?
-        if AXUIElementCopyAttributeValue(root, kAXSubroleAttribute as CFString, &subroleRef) == .success {
-            if let subrole: String = subroleRef as? String, targetSubroles.contains(subrole) {
-                return root
-            }
-        }
-
-        var childrenRef: AnyObject?
-        guard AXUIElementCopyAttributeValue(root, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-              let children: [AXUIElement] = childrenRef as? [AXUIElement]
-        else {
-            return nil
-        }
-
-        for child: AXUIElement in children {
-            if let found: AXUIElement = findElementWithSubrole(root: child, targetSubroles: targetSubroles) {
-                return found
-            }
-        }
-        return nil
-    }
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(level.rawValue)] \(timestamp) \(message)\n"
+    let data = Data(line.utf8)
+    guard let fileHandle = try? FileHandle(forWritingTo: logFileURL) else { return }
+    defer { try? fileHandle.close() }
+    _ = try? fileHandle.seekToEnd()
+    try? fileHandle.write(contentsOf: data)
+  }
 }
 
-private func observerCallback(observer _: AXObserver, element: AXUIElement, notification: CFString, context: UnsafeMutableRawPointer?) {
-    let mover: NotificationMover = Unmanaged<NotificationMover>.fromOpaque(context!).takeUnretainedValue()
-
-    let notificationString: String = notification as String
-    if notificationString == kAXWindowCreatedNotification as String {
-        mover.moveNotification(element)
-    }
+@main
+enum PingPlaceMain {
+  static func main() {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    delegate.launch()
+    app.run()
+  }
 }
-
-let app: NSApplication = .shared
-let delegate: NotificationMover = .init()
-app.delegate = delegate
-app.run()
